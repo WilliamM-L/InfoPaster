@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
@@ -468,6 +469,26 @@ static int any_shortcut_starts_with(const InfoStore *store,
   return 0;
 }
 
+/* Read a single byte with optional timeout.
+ * timeout_ms <= 0 means block indefinitely.
+ * Returns 1 on success, 0 on timeout, -1 on error/EOF.
+ */
+static int read_byte(char *out, int timeout_ms) {
+  if (timeout_ms > 0) {
+    fd_set fds;
+    struct timeval tv;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    int ret = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+    if (ret <= 0)
+      return ret == 0 ? 0 : -1;
+  }
+  ssize_t n = read(STDIN_FILENO, out, 1);
+  return n <= 0 ? -1 : 1;
+}
+
 /* Find entry matching exact shortcut */
 static int find_shortcut(const InfoStore *store, const char *key) {
   for (int i = 0; i < store->count; i++) {
@@ -551,14 +572,34 @@ int main(int argc, char **argv) {
   int copied_idx = -1;
   char input_buf[3] = {0};
   int input_len = 0;
+  int timeout_ms = 0; /* 0 = block indefinitely */
 
   draw_tui(&store, copied_idx);
 
   while (1) {
     char c;
-    ssize_t n = read(STDIN_FILENO, &c, 1);
-    if (n <= 0)
+    int rr = read_byte(&c, timeout_ms);
+    timeout_ms = 0;
+
+    if (rr < 0)
       break;
+
+    if (rr == 0) {
+      /* timeout: fire the best match for current input */
+      int match = find_shortcut(&store, input_buf);
+      if (match >= 0) {
+        if (copy_to_clipboard(store.entries[match].value) == 0)
+          copied_idx = match;
+        else
+          copied_idx = -1;
+      } else {
+        copied_idx = -1;
+      }
+      input_len = 0;
+      input_buf[0] = '\0';
+      draw_tui(&store, copied_idx);
+      continue;
+    }
 
     /* quit */
     if (c == 'q' && input_len == 0) {
@@ -580,10 +621,14 @@ int main(int argc, char **argv) {
       input_buf[input_len] = '\0';
     }
 
+    /* check if any longer shortcut starts with current input */
+    int has_longer = any_shortcut_starts_with(&store, input_buf);
+
     /* check for exact match */
     int match = find_shortcut(&store, input_buf);
-    if (match >= 0) {
-      /* copy to clipboard */
+
+    if (match >= 0 && !has_longer) {
+      /* unambiguous exact match — copy to clipboard */
       if (copy_to_clipboard(store.entries[match].value) == 0) {
         copied_idx = match;
       } else {
@@ -595,9 +640,9 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    /* check if any shortcut starts with current input (wait for more) */
-    if (any_shortcut_starts_with(&store, input_buf)) {
-      continue; /* wait for next char */
+    if (has_longer) {
+      timeout_ms = 500; /* wait up to 500ms for next char */
+      continue;
     }
 
     /* no match possible: reset */
